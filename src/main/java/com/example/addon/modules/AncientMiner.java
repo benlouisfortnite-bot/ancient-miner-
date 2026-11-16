@@ -20,6 +20,7 @@ import net.minecraft.network.chat.Component;
 import net.minecraft.network.protocol.common.ClientboundDisconnectPacket;
 import net.minecraft.tags.ItemTags;
 import net.minecraft.world.InteractionHand;
+import net.minecraft.world.effect.MobEffects;
 import net.minecraft.world.inventory.ChestMenu;
 import net.minecraft.world.inventory.ContainerInput;
 import net.minecraft.world.item.ItemStack;
@@ -97,6 +98,11 @@ public class AncientMiner extends Module {
         .description("Bei so wenig HP (Herzhaelften) UND ohne Totems: disconnecten. 0 = aus.")
         .defaultValue(6).range(0, 19).build());
 
+    private final Setting<Integer> lavaTimeout = sg.add(new IntSetting.Builder()
+        .name("lava-timeout-sec")
+        .description("Kommt er so lange nicht aus der Lava, macht er einen neuen RTP.")
+        .defaultValue(10).range(3, 60).build());
+
     private enum State { MINING, REPAIR_PREP, REPAIR, HOME_WAIT, CHEST, RTP_SEND, RTP_WAIT, DESCEND }
 
     private State state = State.MINING;
@@ -124,6 +130,14 @@ public class AncientMiner extends Module {
     private int idleTicks;
     private boolean descendStarted;
 
+    // Lava-Ausweg
+    private int lavaTicks;
+    private int noLavaTicks;
+    private boolean lavaActive;
+    private boolean lavaRtp;
+    private State lavaPrevState = State.MINING;
+    private BlockPos safeSpot;
+
     public AncientMiner() {
         super(AddonTemplate.CATEGORY, "ancient-miner",
             "Mined automatisch Ancient Debris, repariert die Pickaxe und lagert ein.");
@@ -142,6 +156,13 @@ public class AncientMiner extends Module {
         prevPos = null;
         tpDetected = false;
         lastTpTick = -100000;
+        lavaTicks = 0;
+        noLavaTicks = 0;
+        lavaActive = false;
+        lavaRtp = false;
+        if (mc.player != null && !mc.player.hasEffect(MobEffects.FIRE_RESISTANCE)) {
+            warning("Du hast keine Feuerresistenz! In Lava stirbst du in wenigen Sekunden.");
+        }
         startMining();
     }
 
@@ -149,6 +170,7 @@ public class AncientMiner extends Module {
     public void onDeactivate() {
         if (BaritoneUtils.IS_AVAILABLE) PathManagers.get().stop();
         clicks.clear();
+        releaseKeys();
     }
 
     private void startMining() {
@@ -191,6 +213,9 @@ public class AncientMiner extends Module {
             toggle();
             return;
         }
+
+        // Lava: raus schwimmen, nach lava-timeout-sec neuer RTP. true = normale Logik pausieren
+        if (handleLava()) return;
 
         if (timer > 0) { timer--; return; }
 
@@ -269,17 +294,8 @@ public class AncientMiner extends Module {
         boolean lowHp = minHealth.get() > 0 && mc.player.getHealth() <= minHealth.get();
 
         if (repaired || noXp || lowHp) {
-            InvUtils.move().fromOffhand().toHotbar(pickSlot); // Pickaxe zurueck (Totem geht wieder in die Offhand)
-            InvUtils.swap(pickSlot, false);
             if (noXp && !repaired) warning("Keine XP-Flaschen mehr, Pickaxe nur teilweise repariert.");
-            descendStarted = false;
-            if (returnToDescend || mc.player.getBlockY() > targetY.get() + 3) {
-                state = State.DESCEND;
-            } else {
-                state = State.MINING;
-                startMining();
-            }
-            timer = 10;
+            finishRepair();
             return;
         }
 
@@ -290,6 +306,124 @@ public class AncientMiner extends Module {
             });
             throwTimer = throwDelay.get();
         }
+    }
+
+    private void finishRepair() {
+        InvUtils.move().fromOffhand().toHotbar(pickSlot); // Pickaxe zurueck (Totem geht wieder in die Offhand)
+        InvUtils.swap(pickSlot, false);
+        descendStarted = false;
+        if (returnToDescend || mc.player.getBlockY() > targetY.get() + 3) {
+            state = State.DESCEND;
+        } else {
+            state = State.MINING;
+            startMining();
+        }
+        timer = 10;
+    }
+
+    // ---------------------------------------------------------------- LAVA
+    /** @return true, wenn die normale Zustandslogik in diesem Tick pausieren soll. */
+    private boolean handleLava() {
+        boolean inLava = mc.player.isInLava();
+        boolean freeRoam = state == State.MINING || state == State.DESCEND
+            || state == State.REPAIR_PREP || state == State.REPAIR;
+
+        if (inLava) {
+            noLavaTicks = 0;
+            lavaTicks++;
+
+            if (!lavaActive) {
+                lavaActive = true;
+                warning("In Lava! Versuche rauszukommen.");
+                if (freeRoam) {
+                    PathManagers.get().stop();
+                    if (state == State.REPAIR) finishRepair();      // Pickaxe zurueck in die Hand
+                    else if (state == State.REPAIR_PREP) state = State.MINING;
+                }
+            }
+
+            // Waehrend Teleport-Warmup / Kiste stillhalten, sonst wird der Teleport abgebrochen
+            if (state == State.CHEST || state == State.HOME_WAIT || state == State.RTP_WAIT) {
+                releaseKeys();
+                return false;
+            }
+
+            if (lavaTicks % 10 == 1) safeSpot = findSafeSpot();
+            swimToSafety();
+
+            if (freeRoam && lavaTicks >= lavaTimeout.get() * 20) {
+                warning("Seit " + lavaTimeout.get() + " s in Lava - neuer RTP.");
+                lavaPrevState = state == State.DESCEND ? State.DESCEND : State.MINING;
+                lavaRtp = true;
+                PathManagers.get().stop();
+                rtpAttempts = 0;
+                lavaTicks = 0;
+                state = State.RTP_SEND;
+                timer = 0;
+                return false;
+            }
+            return freeRoam;
+        }
+
+        if (!lavaActive) {
+            lavaTicks = 0;
+            return false;
+        }
+
+        // Aus der Lava raus: kurz abwarten, dann weitermachen
+        if (++noLavaTicks <= 20) return freeRoam;
+
+        lavaActive = false;
+        lavaTicks = 0;
+        noLavaTicks = 0;
+        releaseKeys();
+        info("Aus der Lava raus.");
+
+        if (lavaRtp && state == State.RTP_SEND) {
+            // Er hat es selbst geschafft, bevor der RTP rausging -> RTP abbrechen
+            lavaRtp = false;
+            state = lavaPrevState;
+        }
+        if (state == State.MINING) startMining();
+        else if (state == State.DESCEND) descendStarted = false;
+        timer = 10;
+        return false;
+    }
+
+    private void swimToSafety() {
+        mc.options.keyJump.setDown(true);
+        if (safeSpot == null) return;
+        Vec3 c = Vec3.atCenterOf(safeSpot);
+        Rotations.rotate(Rotations.getYaw(c), Rotations.getPitch(c));
+        mc.options.keyUp.setDown(true);
+    }
+
+    private void releaseKeys() {
+        if (mc.options == null) return;
+        mc.options.keyJump.setDown(false);
+        mc.options.keyUp.setDown(false);
+    }
+
+    /** Naechster Block im Umkreis, auf dem man stehen kann (fester Boden, 2 Luft darueber, keine Lava). */
+    private BlockPos findSafeSpot() {
+        BlockPos p = mc.player.blockPosition();
+        BlockPos best = null;
+        double bestDist = Double.MAX_VALUE;
+        for (int dx = -7; dx <= 7; dx++) {
+            for (int dz = -7; dz <= 7; dz++) {
+                for (int dy = -3; dy <= 4; dy++) {
+                    BlockPos pos = new BlockPos(p.getX() + dx, p.getY() + dy, p.getZ() + dz);
+                    var feet = mc.level.getBlockState(pos);
+                    if (!feet.isAir()) continue;
+                    if (!mc.level.getBlockState(pos.above()).isAir()) continue;
+                    var below = mc.level.getBlockState(pos.below());
+                    if (below.isAir() || !below.getFluidState().isEmpty()) continue;
+                    double d = pos.distSqr(p);
+                    if (d < bestDist) { bestDist = d; best = pos; }
+                }
+            }
+        }
+        return best;
     }
 
     // ---------------------------------------------------------------- HOME / CHEST
@@ -409,6 +543,7 @@ public class AncientMiner extends Module {
     private void tickRtpWait() {
         if (tpDetected) {
             lastTpTick = ticks;
+            lavaRtp = false;
             state = State.DESCEND;
             descendStarted = false;
             timer = 40; // Chunks laden lassen
