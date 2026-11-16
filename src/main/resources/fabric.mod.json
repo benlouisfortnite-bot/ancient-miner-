@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 1,
+  "id": "ancient-miner",
+  "version": "${version}",
+  "name": "Ancient Miner",
+  "description": "Meteor addon: mines Ancient Debris with Baritone, repairs with XP, stashes and re-rolls via RTP.",
+  "authors": [
+    "you"
+  ],
+  "icon": "assets/template/icon.png",
+  "environment": "client",
+  "entrypoints": {
+    "meteor": [
+      "com.example.addon.AddonTemplate"
+    ]
+  },
+  "custom": {
+    "meteor-client:color": "145,61,226",
+    "modmenu": {
+      "parent": {
+        "id": "meteor-client"
+      }
+    }
+  },
+  "depends": {
+    "java": ">=${jdk_version}",
+    "minecraft": "${minecraft_version}",
+    "meteor-client": "*"
+  }
+}
